@@ -221,7 +221,7 @@ free_dplx_rec(struct rpc_dplx_rec *rec)
 }
 
 struct rpc_dplx_rec *
-rpc_dplx_lookup_rec(int fd, uint32_t iflags, uint32_t *oflags)
+rpc_dplx_lookup_rec(int fd, uint32_t iflags)
 {
 	struct rbtree_x_part *t;
 	struct rpc_dplx_rec rk, *rec = NULL;
@@ -245,9 +245,6 @@ rpc_dplx_lookup_rec(int fd, uint32_t iflags, uint32_t *oflags)
 		if (!nv) {
 			rec = alloc_dplx_rec();
 
-			/* tell the caller */
-			*oflags = RPC_DPLX_LKP_OFLAG_ALLOC;
-
 			rec->fd_k = fd;
 
 			if (opr_rbtree_insert(&t->t, &rec->node_k)) {
@@ -262,11 +259,9 @@ rpc_dplx_lookup_rec(int fd, uint32_t iflags, uint32_t *oflags)
 		} else {
 			/* raced */
 			rec = opr_containerof(nv, struct rpc_dplx_rec, node_k);
-			*oflags = RPC_DPLX_LKP_FLAG_NONE;
 		}
 	} else {
 		rec = opr_containerof(nv, struct rpc_dplx_rec, node_k);
-		*oflags = RPC_DPLX_LKP_FLAG_NONE;
 	}
 
 	rpc_dplx_ref(rec,
@@ -282,9 +277,7 @@ rpc_dplx_lookup_rec(int fd, uint32_t iflags, uint32_t *oflags)
 void
 rpc_dplx_slfi(int fd, const char *func, int line)
 {
-	uint32_t oflags;
-	struct rpc_dplx_rec *rec =
-	    rpc_dplx_lookup_rec(fd, RPC_DPLX_FLAG_NONE, &oflags);
+	struct rpc_dplx_rec *rec = rpc_dplx_lookup_rec(fd, RPC_DPLX_FLAG_NONE);
 	rpc_dplx_lock_t *lk = &rec->send.lock;
 
 	mutex_lock(&lk->we.mtx);
@@ -298,9 +291,7 @@ rpc_dplx_slfi(int fd, const char *func, int line)
 void
 rpc_dplx_suf(int fd)
 {
-	uint32_t oflags;
-	struct rpc_dplx_rec *rec =
-	    rpc_dplx_lookup_rec(fd, RPC_DPLX_FLAG_NONE, &oflags);
+	struct rpc_dplx_rec *rec = rpc_dplx_lookup_rec(fd, RPC_DPLX_FLAG_NONE);
 	/* assert: initialized */
 	mutex_unlock(&rec->send.lock.we.mtx);
 }
@@ -308,9 +299,7 @@ rpc_dplx_suf(int fd)
 void
 rpc_dplx_rlfi(int fd, const char *func, int line)
 {
-	uint32_t oflags;
-	struct rpc_dplx_rec *rec =
-	    rpc_dplx_lookup_rec(fd, RPC_DPLX_FLAG_NONE, &oflags);
+	struct rpc_dplx_rec *rec = rpc_dplx_lookup_rec(fd, RPC_DPLX_FLAG_NONE);
 	rpc_dplx_lock_t *lk = &rec->recv.lock;
 
 	mutex_lock(&lk->we.mtx);
@@ -323,9 +312,7 @@ rpc_dplx_rlfi(int fd, const char *func, int line)
 void
 rpc_dplx_ruf(int fd)
 {
-	uint32_t oflags;
-	struct rpc_dplx_rec *rec =
-	    rpc_dplx_lookup_rec(fd, RPC_DPLX_FLAG_NONE, &oflags);
+	struct rpc_dplx_rec *rec = rpc_dplx_lookup_rec(fd, RPC_DPLX_FLAG_NONE);
 	/* assert: initialized */
 	mutex_unlock(&rec->recv.lock.we.mtx);
 }

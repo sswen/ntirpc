@@ -112,7 +112,6 @@ clnt_dg_ncreate(int fd,	/* open file descriptor */
 	struct timespec now;
 	struct rpc_msg call_msg;
 	struct __rpc_sockinfo si;
-	uint32_t oflags;
 	int one = 1;
 
 	if (svcaddr == NULL) {
@@ -194,8 +193,7 @@ clnt_dg_ncreate(int fd,	/* open file descriptor */
 	cu->cu_fd = fd;
 	clnt->cl_ops = clnt_dg_ops();
 	clnt->cl_p1 = cx;
-	clnt->cl_p2 = rpc_dplx_lookup_rec(fd, RPC_DPLX_LKP_FLAG_NONE,
-					  &oflags); /* ref+1 */
+	clnt->cl_p2 = rpc_dplx_lookup_rec(fd, RPC_DPLX_LKP_FLAG_NONE); /*ref+1*/
 	clnt->cl_tp = NULL;
 	clnt->cl_netid = NULL;
 
