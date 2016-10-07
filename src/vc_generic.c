@@ -296,6 +296,8 @@ vc_shared_destroy(struct x_vc_data *xd)
 	/* svc_vc */
 	xprt = rec->hdl.xprt;
 	if (xprt) {
+		if ((xprt->xp_fd != RPC_ANYFD) && !closed)
+			(void)close(xprt->xp_fd);
 		xprt->xp_p1 = NULL;
 		xd->refcnt--;
 	}
