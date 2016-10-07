@@ -282,7 +282,6 @@ vc_shared_destroy(struct x_vc_data *xd)
 	struct ct_data *ct = &xd->cx.data;
 	SVCXPRT *xprt;
 	bool closed = false;
-	bool xdrs_destroyed = false;
 
 	/* RECLOCKED */
 
@@ -291,54 +290,29 @@ vc_shared_destroy(struct x_vc_data *xd)
 		closed = true;
 	}
 
-	/* destroy shared XDR record streams (once) */
-	XDR_DESTROY(&xd->shared.xdrs_in);
-	XDR_DESTROY(&xd->shared.xdrs_out);
-	xdrs_destroyed = true;
-
 	if (ct->ct_addr.buf)
 		mem_free(ct->ct_addr.buf, 0);	/* XXX */
 
 	/* svc_vc */
 	xprt = rec->hdl.xprt;
 	if (xprt) {
-
-		XPRT_TRACE(xprt, __func__, __func__, __LINE__);
-
-		rec->hdl.xprt = NULL;	/* unreachable */
-
-		if (!closed) {
-			if (xprt->xp_fd != RPC_ANYFD)
-				(void)close(xprt->xp_fd);
-		}
-
-		/* request socket */
-		if (!xdrs_destroyed) {
-			XDR_DESTROY(&(xd->shared.xdrs_in));
-			XDR_DESTROY(&(xd->shared.xdrs_out));
-		}
-
-		if (xprt->xp_tp)
-			mem_free(xprt->xp_tp, 0);
-		if (xprt->xp_netid)
-			mem_free(xprt->xp_netid, 0);
-
-		if (xprt->xp_ops->xp_free_user_data) {
-			/* call free hook */
-			xprt->xp_ops->xp_free_user_data(xprt);
-		}
-
-		mem_free(xprt, sizeof(SVCXPRT));
+		xprt->xp_p1 = NULL;
+		xd->refcnt--;
 	}
 
 	rec->hdl.xd = NULL;
+	xd->refcnt--;
 
-	/* unref shared */
-	REC_UNLOCK(rec);
-
-	if (xprt)
-		rpc_dplx_unref(rec, RPC_DPLX_FLAG_NONE);
+	rpc_dplx_unref(rec, RPC_DPLX_FLAG_LOCKED | RPC_DPLX_FLAG_UNLOCK);
 
 	/* free xd itself */
-	mem_free(xd, sizeof(struct x_vc_data));
+	if (xd->refcnt == 0) {
+		/* destroy shared XDR record streams (once) */
+		XDR_DESTROY(&xd->shared.xdrs_in);
+		XDR_DESTROY(&xd->shared.xdrs_out);
+		mem_free(xd, sizeof(struct x_vc_data));
+	} else
+		__warnx(TIRPC_DEBUG_FLAG_REFCNT,
+			"%s: xd_refcnt %u on destroyed %p omit "
+			, __func__, xd->refcnt, xd);
 }

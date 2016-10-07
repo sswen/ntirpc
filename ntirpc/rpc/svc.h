@@ -154,6 +154,7 @@ typedef struct svc_init_params {
 #define SVC_XPRT_FLAG_DESTROYED		0x0020	/* SVC_DESTROY() was called */
 #define SVC_XPRT_FLAG_DESTROYING	0x0040	/* (*xp_destroy) was called */
 #define SVC_XPRT_FLAG_VSOCK             0x0080
+#define SVC_XPRT_FLAG_ALLOCATED		0x8000
 
 /* uint32_t instructions */
 #define SVC_XPRT_FLAG_LOCK		SVC_XPRT_FLAG_NONE
@@ -195,7 +196,7 @@ enum xprt_stat {
 	XPRT_DESTROYED
 };
 
-struct cf_rendezvous {		/* kept in xprt->xp_p1 for rendezvouser */
+struct cf_rendezvous {		/* kept in xprt->xp_p2 for rendezvouser */
 	u_int sendsize;
 	u_int recvsize;
 	int maxrec;

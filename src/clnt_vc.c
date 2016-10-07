@@ -165,7 +165,6 @@ clnt_vc_ncreate2(int fd,	/* open file descriptor */
 	struct __rpc_sockinfo si;
 	struct sockaddr_storage ss;
 	XDR ct_xdrs[1];		/* temp XDR stream */
-	uint32_t oflags;
 	socklen_t slen;
 
 	sigfillset(&newmask);
@@ -193,7 +192,7 @@ clnt_vc_ncreate2(int fd,	/* open file descriptor */
 		goto err;
 
 	/* atomically find or create shared fd state */
-	rec = rpc_dplx_lookup_rec(fd, RPC_DPLX_LKP_IFLAG_LOCKREC, &oflags);
+	rec = rpc_dplx_lookup_rec(fd, RPC_DPLX_LKP_IFLAG_LOCKREC);
 	if (!rec) {
 		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
 			"clnt_vc_ncreate2: rpc_dplx_lookup_rec failed");
@@ -201,20 +200,24 @@ clnt_vc_ncreate2(int fd,	/* open file descriptor */
 	}
 
 	/* attach shared state */
-	if ((oflags & RPC_DPLX_LKP_OFLAG_ALLOC) || (!rec->hdl.xd)) {
-		xd = rec->hdl.xd = alloc_x_vc_data();
-		if (!xd) {
+	if (!rec->hdl.xd) {
+		xd = alloc_x_vc_data();
+		if (xd == NULL) {
 			(void)syslog(LOG_ERR, clnt_vc_errstr, clnt_vc_str,
 				     __no_mem_str);
 			rpc_createerr.cf_stat = RPC_SYSTEMERROR;
 			rpc_createerr.cf_error.re_errno = errno;
 			goto err;
 		}
+		rec->hdl.xd = xd;
+		xd->refcnt++;
+
 		xd->rec = rec;
+		rpc_dplx_ref(rec, RPC_DPLX_FLAG_LOCKED);
+
 		/* XXX tracks outstanding calls */
 		opr_rbtree_init(&xd->cx.calls.t, call_xid_cmpf);
 		xd->cx.calls.xid = 0;	/* next call xid is 1 */
-		xd->refcnt = 1;
 
 		xd->shared.sendsz =
 		    __rpc_get_t_size(si.si_af, si.si_proto, (int)sendsz);
@@ -229,19 +232,17 @@ clnt_vc_ncreate2(int fd,	/* open file descriptor */
 		xdrrec_create(&(xd->shared.xdrs_out), sendsz, xd->shared.recvsz,
 			      xd, generic_read_vc, generic_write_vc);
 		xd->shared.xdrs_out.x_op = XDR_ENCODE;
-	} else {
+	} else
 		xd = rec->hdl.xd;
-		++(xd->refcnt);
-	}
 
-	clnt = (CLIENT *) mem_alloc(sizeof(CLIENT));
+	clnt = (CLIENT *) mem_zalloc(sizeof(CLIENT));
 
 	mutex_init(&clnt->cl_lock, NULL);
 	clnt->cl_flags = CLNT_FLAG_NONE;
-	clnt->cl_refcnt = 1;
 
 	/* private data struct */
 	xd->cx.data.ct_fd = fd;
+
 	cs = mem_alloc(sizeof(struct ct_serialized));
 
 	ct = &xd->cx.data;
@@ -282,14 +283,21 @@ clnt_vc_ncreate2(int fd,	/* open file descriptor */
 	 * and authnone for authentication.
 	 */
 	clnt->cl_ops = clnt_vc_ops();
+
 	clnt->cl_p1 = xd;
+	xd->refcnt++;
+
 	clnt->cl_p2 = rec;
+	rpc_dplx_ref(rec, RPC_DPLX_FLAG_LOCKED);
+
 	clnt->cl_p3 = cs;
 
 	/* release rec */
 	REC_UNLOCK(rec);
 
 	thr_sigsetmask(SIG_SETMASK, &(mask), NULL);
+
+	clnt_vc_ref(clnt, CLNT_REF_FLAG_NONE);  /* ref for returned clnt */
 	return (clnt);
 
  err:
@@ -299,16 +307,22 @@ clnt_vc_ncreate2(int fd,	/* open file descriptor */
 	}
 
 	if (clnt) {
+		xd->refcnt--;
+		rpc_dplx_unref(rec, RPC_DPLX_FLAG_LOCKED);
+
 		mutex_destroy(&clnt->cl_lock);
 		mem_free(clnt, sizeof(CLIENT));
 	}
 
 	if (rec) {
-		if (rpc_dplx_unref(rec, RPC_DPLX_FLAG_LOCKED))
-			REC_UNLOCK(rec);
+		/* return reference from lookup */
+		rpc_dplx_unref(rec, RPC_DPLX_FLAG_LOCKED |
+				    RPC_DPLX_FLAG_UNLOCK);
 	}
 
 	if (xd) {
+		rpc_dplx_unref(xd->rec, RPC_DPLX_FLAG_NONE);
+
 		if (ct->ct_addr.len)
 			mem_free(ct->ct_addr.buf, ct->ct_addr.len);
 
@@ -787,9 +801,9 @@ clnt_vc_release(CLIENT *clnt, u_int flags)
 		struct x_vc_data *xd = (struct x_vc_data *)clnt->cl_p1;
 		struct rpc_dplx_rec *rec = xd->rec;
 		struct ct_serialized *cs = (struct ct_serialized *)clnt->cl_p3;
-		uint32_t xd_refcnt;
 
 		mutex_unlock(&clnt->cl_lock);
+		mutex_destroy(&clnt->cl_lock);
 
 		/* client handles are now freed directly */
 		mem_free(cs, sizeof(struct ct_serialized));
@@ -797,24 +811,14 @@ clnt_vc_release(CLIENT *clnt, u_int flags)
 			mem_free(clnt->cl_netid, strlen(clnt->cl_netid) + 1);
 		if (clnt->cl_tp && clnt->cl_tp[0])
 			mem_free(clnt->cl_tp, strlen(clnt->cl_tp) + 1);
-		mutex_destroy(&clnt->cl_lock);
+
 		mem_free(clnt, sizeof(CLIENT));
 
 		REC_LOCK(rec);
-		xd_refcnt = --(xd->refcnt);
+		xd->refcnt--;  /* clnt's reference */
+		rpc_dplx_unref(rec, RPC_DPLX_FLAG_LOCKED);
 
-		if (xd_refcnt == 0) {
-			__warnx(TIRPC_DEBUG_FLAG_REFCNT,
-				"%s: xd_refcnt %u on destroyed %p %u calling "
-				"vc_shared_destroy", __func__, clnt, cl_refcnt);
-			vc_shared_destroy(xd);	/* RECLOCKED */
-			rpc_dplx_unref(rec, RPC_DPLX_FLAG_NONE);
-		} else {
-			__warnx(TIRPC_DEBUG_FLAG_REFCNT,
-				"%s: xd_refcnt %u on destroyed %p omit "
-				"vc_shared_destroy", __func__, clnt, cl_refcnt);
-			rpc_dplx_unref(rec, RPC_DPLX_FLAG_LOCKED);
-		}
+		vc_shared_destroy(xd);	/* RECLOCKED */
 	} else
 		mutex_unlock(&clnt->cl_lock);
 }
@@ -825,12 +829,11 @@ clnt_vc_destroy(CLIENT *clnt)
 	struct rpc_dplx_rec *rec;
 	struct x_vc_data *xd;
 	uint32_t cl_refcnt = 0;
-	uint32_t xd_refcnt = 0;
 
 	mutex_lock(&clnt->cl_lock);
 	if (clnt->cl_flags & CLNT_FLAG_DESTROYED) {
 		mutex_unlock(&clnt->cl_lock);
-		goto out;
+		return;
 	}
 
 	xd = (struct x_vc_data *)clnt->cl_p1;
@@ -838,45 +841,32 @@ clnt_vc_destroy(CLIENT *clnt)
 
 	clnt->cl_flags |= CLNT_FLAG_DESTROYED;
 	cl_refcnt = --(clnt->cl_refcnt);
-	mutex_unlock(&clnt->cl_lock);
 
 	__warnx(TIRPC_DEBUG_FLAG_REFCNT, "%s: cl_destroy %p cl_refcnt %u",
 		__func__, clnt, cl_refcnt);
 
-	/* bidirectional */
-	REC_LOCK(rec);
-
-	xd_refcnt = --(xd->refcnt);
-
 	/* conditional destroy */
-	if (cl_refcnt == 0) {
+	if (cl_refcnt != 0)
+		return;
 
-		struct ct_serialized *cs = (struct ct_serialized *)clnt->cl_p3;
+	mutex_unlock(&clnt->cl_lock);
+	mutex_destroy(&clnt->cl_lock);
 
-		/* client handles are now freed directly */
-		mem_free(cs, sizeof(struct ct_serialized));
-		if (clnt->cl_netid && clnt->cl_netid[0])
-			mem_free(clnt->cl_netid, strlen(clnt->cl_netid) + 1);
-		if (clnt->cl_tp && clnt->cl_tp[0])
-			mem_free(clnt->cl_tp, strlen(clnt->cl_tp) + 1);
-		mutex_destroy(&clnt->cl_lock);
-		mem_free(clnt, sizeof(CLIENT));
+	/* client handles are now freed directly */
+	mem_free(clnt->cl_p3, sizeof(struct ct_serialized));
 
-		if (xd_refcnt == 0) {
-			__warnx(TIRPC_DEBUG_FLAG_REFCNT,
-				"%s: %p cl_refcnt %u xd_refcnt %u calling "
-				"vc_shared_destroy", __func__, clnt, cl_refcnt,
-				xd_refcnt);
-			vc_shared_destroy(xd);	/* RECLOCKED */
-			rpc_dplx_unref(rec, RPC_DPLX_FLAG_NONE);
-			goto out;
-		}
-	}
+	if (clnt->cl_netid && clnt->cl_netid[0])
+		mem_free(clnt->cl_netid, strlen(clnt->cl_netid) + 1);
+	if (clnt->cl_tp && clnt->cl_tp[0])
+		mem_free(clnt->cl_tp, strlen(clnt->cl_tp) + 1);
 
-	REC_UNLOCK(rec);
+	mem_free(clnt, sizeof(CLIENT));
 
- out:
-	return;
+	REC_LOCK(rec);
+	xd->refcnt--;
+	rpc_dplx_unref(rec, RPC_DPLX_FLAG_LOCKED);
+
+	vc_shared_destroy(xd);	/* RECLOCKED */
 }
 
 static struct clnt_ops *

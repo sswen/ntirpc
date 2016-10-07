@@ -88,7 +88,7 @@ static void svc_vc_override_ops(SVCXPRT *, SVCXPRT *);
 
 bool __svc_clean_idle2(int, bool);
 
-static SVCXPRT *makefd_xprt(int, u_int, u_int, bool *);
+static SVCXPRT *makefd_xprt(int, u_int, u_int);
 
 extern pthread_mutex_t svc_ctr_lock;
 
@@ -122,7 +122,6 @@ svc_vc_ncreate2(int fd, u_int sendsize, u_int recvsize, u_int flags)
 	struct rpc_dplx_rec *rec = NULL;
 	struct x_vc_data *xd = NULL;
 	const char *netid;
-	uint32_t oflags;
 	socklen_t slen;
 
 	if (!__rpc_fd2sockinfo(fd, &si))
@@ -135,34 +134,37 @@ svc_vc_ncreate2(int fd, u_int sendsize, u_int recvsize, u_int flags)
 	flags |= (si.si_af == AF_VSOCK) ? SVC_VC_CREATE_VSOCK : 0;
 #endif /* VSOCK */
 
+	/* atomically find or create shared fd state */
+	rec = rpc_dplx_lookup_rec(fd, RPC_DPLX_LKP_IFLAG_LOCKREC);
+	if (!rec) {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"svc_vc: makefd_xprt: rpc_dplx_lookup_rec failed");
+		return NULL;
+	}
+
 	rdvs = mem_alloc(sizeof(struct cf_rendezvous));
 	rdvs->sendsize = __rpc_get_t_size(si.si_af, si.si_proto, (int)sendsize);
 	rdvs->recvsize = __rpc_get_t_size(si.si_af, si.si_proto, (int)recvsize);
 	rdvs->maxrec = __svc_maxrec;
 
-	/* atomically find or create shared fd state */
-	rec = rpc_dplx_lookup_rec(fd, RPC_DPLX_LKP_IFLAG_LOCKREC, &oflags);
-	if (!rec) {
-		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
-			"svc_vc: makefd_xprt: rpc_dplx_lookup_rec failed");
-		goto err;
-	}
-
 	/* attach shared state */
-	if ((oflags & RPC_DPLX_LKP_OFLAG_ALLOC) || (!rec->hdl.xd)) {
-		xd = rec->hdl.xd = alloc_x_vc_data();
+	if (!rec->hdl.xd) {
+		xd = alloc_x_vc_data();
 		if (xd == NULL) {
 			__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
 				"svc_vc: makefd_xprt: out of memory");
 			goto err;
 		}
 
+		rec->hdl.xd = xd;
+		xd->refcnt++;
+
 		xd->rec = rec;
+		rpc_dplx_ref(rec, RPC_DPLX_FLAG_LOCKED);
 
 		/* XXX tracks outstanding calls */
 		opr_rbtree_init(&xd->cx.calls.t, call_xid_cmpf);
 		xd->cx.calls.xid = 0;	/* next call xid is 1 */
-		xd->refcnt = 1;
 
 		xd->shared.sendsz =
 		    __rpc_get_t_size(si.si_af, si.si_proto, (int)sendsize);
@@ -175,30 +177,32 @@ svc_vc_ncreate2(int fd, u_int sendsize, u_int recvsize, u_int flags)
 	} else {
 		xd = (struct x_vc_data *)rec->hdl.xd;
 		/* dont return destroyed xprts */
-		if (!(xd->flags & X_VC_DATA_FLAG_SVC_DESTROYED)) {
-			if (rec->hdl.xprt) {
-				xprt = rec->hdl.xprt;
-				/* inc xprt refcnt */
-				SVC_REF(xprt, SVC_REF_FLAG_NONE);
-				mem_free(rdvs, sizeof(struct cf_rendezvous));
-				goto done;
-			} else
-				++(xd->refcnt);
+		if (!(xd->flags & X_VC_DATA_FLAG_SVC_DESTROYED) &&
+		    (rec->hdl.xprt)) {
+			xprt = rec->hdl.xprt;
+			mem_free(rdvs, sizeof(struct cf_rendezvous));
+			goto done;
 		}
-		/* return extra ref */
-		rpc_dplx_unref(rec,
-			       RPC_DPLX_FLAG_LOCKED | RPC_DPLX_FLAG_UNLOCK);
 	}
 
 	xprt = mem_zalloc(sizeof(SVCXPRT));
 	xprt->xp_flags = SVC_XPRT_FLAG_NONE;
-	xprt->xp_refs = 1;
+
 	svc_vc_rendezvous_ops(xprt, flags);
-	xprt->xp_p1 = rdvs;
-	xprt->xp_p2 = xd;
+
+	xprt->xp_p1 = xd;
+	xd->refcnt++;
+
 	xprt->xp_p5 = rec;
+	rpc_dplx_ref(rec, RPC_DPLX_FLAG_LOCKED);
+
 	xprt->xp_fd = fd;
+	xprt->xp_p2 = rdvs;
 	mutex_init(&xprt->xp_lock, NULL);
+
+	/* make reachable from rec */
+	rec->hdl.xprt = xprt;
+	svc_ref(xprt, xprt->xp_flags);
 
 	/* caller should know what it's doing */
 	if (flags & SVC_VC_CREATE_LISTEN)
@@ -227,9 +231,6 @@ svc_vc_ncreate2(int fd, u_int sendsize, u_int recvsize, u_int flags)
 
 	xprt->xp_netid = mem_strdup(netid);
 
-	/* make reachable from rec */
-	rec->hdl.xprt = xprt;
-
 	/* release rec */
 	REC_UNLOCK(rec);
 
@@ -246,6 +247,7 @@ svc_vc_ncreate2(int fd, u_int sendsize, u_int recvsize, u_int flags)
 #endif
 
  done:
+	svc_ref(xprt, xprt->xp_flags);  /* inc for the returned reference */
 	return (xprt);
 
  err:
@@ -256,12 +258,22 @@ svc_vc_ncreate2(int fd, u_int sendsize, u_int recvsize, u_int flags)
 		if (xprt->blkin.svc_name)
 			mem_free(xprt->blkin.svc_name, 2*INET6_ADDRSTRLEN);
 #endif
-		mem_free(xprt, sizeof(SVCXPRT));
+		if (xprt->xp_p1)
+			xd->refcnt--;
+
+		if (xprt->xp_p5)
+			rpc_dplx_ref(rec, RPC_DPLX_FLAG_LOCKED);
+
+		svc_release(xprt, xprt->xp_flags);  /* return ref from rec */
 	}
 
-	if (rec) {
-		rpc_dplx_unref(rec,
-			       RPC_DPLX_FLAG_LOCKED | RPC_DPLX_FLAG_UNLOCK);
+	/* return ref from rpc_dplx_lookup_rec() */
+	rpc_dplx_unref(rec, RPC_DPLX_FLAG_LOCKED | RPC_DPLX_FLAG_UNLOCK);
+
+	if (xd) {
+		rpc_dplx_unref(xd->rec, RPC_DPLX_FLAG_NONE);
+		if (xd->refcnt == 0)
+			free_x_vc_data(xd);
 	}
 
 	return (NULL);
@@ -283,12 +295,13 @@ svc_fd_ncreate(int fd, u_int sendsize, u_int recvsize)
 	struct sockaddr_storage ss;
 	socklen_t slen;
 	SVCXPRT *xprt;
-	bool xprt_allocd;
 
 	assert(fd != -1);
 
-	xprt = makefd_xprt(fd, sendsize, recvsize, &xprt_allocd);
-	if ((!xprt) || (!xprt_allocd))	/* ref'd existing xprt handle */
+	xprt = makefd_xprt(fd, sendsize, recvsize);
+	if ((!xprt) ||  /* ref'd existing xprt */
+	    atomic_postclear_uint16_t_bits(&xprt->xp_flags,
+					   SVC_XPRT_FLAG_ALLOCATED))
 		goto done;
 
 	/* conditional xprt_register */
@@ -315,6 +328,7 @@ svc_fd_ncreate(int fd, u_int sendsize, u_int recvsize)
 	return (xprt);
 
  freedata:
+	svc_release(xprt, xprt->xp_flags);
 	return (NULL);
 }
 
@@ -328,19 +342,20 @@ svc_fd_ncreate2(int fd, u_int sendsize, u_int recvsize, u_int flags)
 	struct sockaddr *sa = (struct sockaddr *)(void *)&ss;
 	socklen_t slen;
 	SVCXPRT *xprt;
-	bool xprt_allocd;
 
 	assert(fd != -1);
 
-	xprt = makefd_xprt(fd, sendsize, recvsize, &xprt_allocd);
-	if ((!xprt) || (!xprt_allocd))	/* ref'd existing xprt handle */
+	xprt = makefd_xprt(fd, sendsize, recvsize);
+	if ((!xprt) ||  /* ref'd existing xprt */
+	    atomic_postclear_uint16_t_bits(&xprt->xp_flags,
+					   SVC_XPRT_FLAG_ALLOCATED))
 		return (xprt);
 
 	slen = sizeof(struct sockaddr_storage);
 	if (getsockname(fd, sa, &slen) < 0) {
 		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
 			"svc_fd_ncreate: could not retrieve local addr");
-		return (NULL);
+		goto freedata;
 	}
 	__rpc_set_address(&xprt->xp_local, &ss, slen);
 
@@ -348,7 +363,7 @@ svc_fd_ncreate2(int fd, u_int sendsize, u_int recvsize, u_int flags)
 	if (getpeername(fd, (struct sockaddr *)(void *)&ss, &slen) < 0) {
 		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
 			"svc_fd_ncreate: could not retrieve remote addr");
-		return (NULL);
+		goto freedata;
 	}
 	__rpc_set_address(&xprt->xp_remote, &ss, slen);
 
@@ -358,19 +373,20 @@ svc_fd_ncreate2(int fd, u_int sendsize, u_int recvsize, u_int flags)
 		xprt_register(xprt);
 
 	return (xprt);
+
+ freedata:
+	svc_release(xprt, xprt->xp_flags);
+	return (NULL);
 }
 
 static SVCXPRT *
-	makefd_xprt(int fd, u_int sendsz, u_int recvsz, bool *allocated)
+makefd_xprt(int fd, u_int sendsz, u_int recvsz)
 {
 	SVCXPRT *xprt = NULL;
 	struct x_vc_data *xd = NULL;
 	struct rpc_dplx_rec *rec;
 	struct __rpc_sockinfo si;
 	const char *netid;
-	uint32_t oflags;
-	bool newxd = false;
-	*allocated = false;
 
 	assert(fd != -1);
 
@@ -382,34 +398,31 @@ static SVCXPRT *
 	}
 
 	/* atomically find or create shared fd state */
-	rec = rpc_dplx_lookup_rec(fd, RPC_DPLX_LKP_IFLAG_LOCKREC, &oflags);
+	rec = rpc_dplx_lookup_rec(fd, RPC_DPLX_LKP_IFLAG_LOCKREC);
 	if (!rec) {
 		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
 			"svc_vc: makefd_xprt: rpc_dplx_lookup_rec failed");
-		goto done;
+		return NULL;
 	}
 
 	/* attach shared state */
-	if ((oflags & RPC_DPLX_LKP_OFLAG_ALLOC) || (!rec->hdl.xd)) {
-		newxd = true;
-		xd = rec->hdl.xd = alloc_x_vc_data();
+	if (!rec->hdl.xd) {
+		xd = alloc_x_vc_data();
 		if (xd == NULL) {
 			__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
 				"svc_vc: makefd_xprt: out of memory");
-			/* return extra ref */
-			rpc_dplx_unref(rec,
-				       RPC_DPLX_FLAG_LOCKED |
-				       RPC_DPLX_FLAG_UNLOCK);
-			mem_free(xprt, sizeof(SVCXPRT));
-			goto done;
+			goto err;
 		}
 
+		rec->hdl.xd = xd;
+		xd->refcnt++;
+
 		xd->rec = rec;
+		rpc_dplx_ref(rec, RPC_DPLX_FLAG_LOCKED);
 
 		/* XXX tracks outstanding calls */
 		opr_rbtree_init(&xd->cx.calls.t, call_xid_cmpf);
 		xd->cx.calls.xid = 0;	/* next call xid is 1 */
-		xd->refcnt = 1;
 
 		if (__rpc_fd2sockinfo(fd, &si)) {
 			xd->shared.sendsz =
@@ -431,21 +444,11 @@ static SVCXPRT *
 	} else {
 		xd = (struct x_vc_data *)rec->hdl.xd;
 		/* dont return destroyed xprts */
-		if (!(xd->flags & X_VC_DATA_FLAG_SVC_DESTROYED)) {
-			if (rec->hdl.xprt) {
-				xprt = rec->hdl.xprt;
-				/* inc xprt refcnt */
-				SVC_REF(xprt, SVC_REF_FLAG_NONE);
-			} else
-				++(xd->refcnt);
+		if (!(xd->flags & X_VC_DATA_FLAG_SVC_DESTROYED) &&
+		   (rec->hdl.xprt)) {
+			xprt = rec->hdl.xprt;
+			goto done;
 		}
-		/* return extra ref */
-		rpc_dplx_unref(rec,
-			       RPC_DPLX_FLAG_LOCKED | RPC_DPLX_FLAG_UNLOCK);
-		*allocated = FALSE;
-
-		/* return ref'd xprt */
-		goto done_xprt;
 	}
 
 	/* XXX bi-directional?  initially I had assumed that explicit
@@ -456,14 +459,23 @@ static SVCXPRT *
 
 	/* new xprt (the common case) */
 	xprt = mem_zalloc(sizeof(SVCXPRT));
+	xprt->xp_flags = SVC_XPRT_FLAG_ALLOCATED;
 
-	*allocated = TRUE;
+	xprt->xp_p1 = xd;
+	xd->refcnt++;
+
 	xprt->xp_p5 = rec;
-	mutex_init(&xprt->xp_lock, NULL);
-	/* XXX take xp_lock? */
-	mutex_init(&xprt->xp_auth_lock, NULL);
-	xprt->xp_refs = 1;
+	rpc_dplx_ref(rec, RPC_DPLX_FLAG_LOCKED);
+
 	xprt->xp_fd = fd;
+
+	/* XXX take xp_lock? */
+	mutex_init(&xprt->xp_lock, NULL);
+	mutex_init(&xprt->xp_auth_lock, NULL);
+
+	/* make reachable from rec */
+	rec->hdl.xprt = xprt;
+	svc_ref(xprt, xprt->xp_flags);
 
 	/* the SVCXPRT created in svc_vc_create accepts new connections
 	 * in its xp_recv op, the rendezvous_request method, but xprt is
@@ -477,12 +489,9 @@ static SVCXPRT *
 
 	xd->sx.strm_stat = XPRT_IDLE;
 
-	xprt->xp_p1 = xd;
-	if (newxd /* ensures valid si */ && __rpc_sockinfo2netid(&si, &netid))
+	/* ensures valid si */
+	if (__rpc_sockinfo2netid(&si, &netid))
 		xprt->xp_netid = mem_strdup(netid);
-
-	/* make reachable from rec */
-	rec->hdl.xprt = xprt;
 
 	/* release */
 	REC_UNLOCK(rec);
@@ -490,9 +499,34 @@ static SVCXPRT *
 	/* Make reachable from xprt list.  Registration deferred. */
 	svc_rqst_init_xprt(xprt);
 
-done_xprt:
 done:
+	svc_ref(xprt, xprt->xp_flags);
 	return (xprt);
+
+err:
+	if (xprt) {
+		if (xprt->xp_p1)
+			xd->refcnt--;
+
+		if (xprt->xp_p5)
+			rpc_dplx_ref(rec, RPC_DPLX_FLAG_LOCKED);
+
+		svc_release(xprt, xprt->xp_flags);  /* return ref from rec */
+	}
+
+	/* return ref from rpc_dplx_lookup_rec() */
+	rpc_dplx_unref(rec, RPC_DPLX_FLAG_LOCKED | RPC_DPLX_FLAG_UNLOCK);
+
+	if (xd) {
+		rpc_dplx_unref(xd->rec, RPC_DPLX_FLAG_NONE);
+		if (xd->refcnt == 0) {
+			XDR_DESTROY(&xd->shared.xdrs_in);
+			XDR_DESTROY(&xd->shared.xdrs_out);
+			free_x_vc_data(xd);
+		}
+	}
+
+	return (NULL);
 }
 
  /*ARGSUSED*/
@@ -507,10 +541,9 @@ rendezvous_request(SVCXPRT *xprt, struct svc_req *req)
 	struct __rpc_sockinfo si;
 	socklen_t slen;
 	SVCXPRT *newxprt;
-	bool xprt_allocd;
 	static int n = 1;
 
-	rdvs = (struct cf_rendezvous *)xprt->xp_p1;
+	rdvs = (struct cf_rendezvous *)xprt->xp_p2;
  again:
 	len = sizeof(addr);
 	fd = accept(xprt->xp_fd, (struct sockaddr *)(void *)&addr, &len);
@@ -541,8 +574,10 @@ rendezvous_request(SVCXPRT *xprt, struct svc_req *req)
 	/*
 	 * make a new transport (re-uses xprt)
 	 */
-	newxprt = makefd_xprt(fd, rdvs->sendsize, rdvs->recvsize, &xprt_allocd);
-	if ((!newxprt) || (!xprt_allocd)) /* ref'd existing xprt handle */
+	newxprt = makefd_xprt(fd, rdvs->sendsize, rdvs->recvsize);
+	if ((!newxprt) ||  /* ref'd existing xprt */
+	    atomic_postclear_uint16_t_bits(&newxprt->xp_flags,
+					   SVC_XPRT_FLAG_ALLOCATED))
 		return (FALSE);
 
 	/*
@@ -625,8 +660,8 @@ rendezvous_stat(SVCXPRT *xprt)
 static void
 svc_rdvs_destroy(SVCXPRT *xprt, u_int flags, const char *tag, const int line)
 {
-	struct cf_rendezvous *rdvs = (struct cf_rendezvous *)xprt->xp_p1;
-	struct x_vc_data *xd = (struct x_vc_data *)xprt->xp_p2;
+	struct cf_rendezvous *rdvs = (struct cf_rendezvous *)xprt->xp_p2;
+	struct x_vc_data *xd = (struct x_vc_data *)xprt->xp_p1;
 	struct rpc_dplx_rec *rec = (struct rpc_dplx_rec *)xprt->xp_p5;
 
 	/* clears xprt from the xprt table (eg, idle scans) */
@@ -656,10 +691,13 @@ svc_rdvs_destroy(SVCXPRT *xprt, u_int flags, const char *tag, const int line)
 
 	mem_free(rdvs, sizeof(struct cf_rendezvous));
 	mem_free(xprt, sizeof(SVCXPRT));
+	xd->refcnt--;  /* xprt's reference */
 
+	rec->hdl.xprt = NULL;
 	(void)rpc_dplx_unref(rec, RPC_DPLX_FLAG_LOCKED | RPC_DPLX_FLAG_UNLOCK);
 
 	if (xd->refcnt == 0) {
+		(void)rpc_dplx_unref(rec, RPC_DPLX_FLAG_NONE);
 		XDR_DESTROY(&xd->shared.xdrs_in);
 		XDR_DESTROY(&xd->shared.xdrs_out);
 		free_x_vc_data(xd);
@@ -671,7 +709,6 @@ svc_vc_destroy(SVCXPRT *xprt, u_int flags, const char *tag, const int line)
 {
 	struct x_vc_data *xd = (struct x_vc_data *)xprt->xp_p1;
 	struct rpc_dplx_rec *rec = xd->rec;
-	uint32_t xd_refcnt;
 
 	/* connection tracking--decrement now, he's dead jim */
 	svc_vc_dec_nconns();
@@ -682,29 +719,21 @@ svc_vc_destroy(SVCXPRT *xprt, u_int flags, const char *tag, const int line)
 	/* bidirectional */
 	REC_LOCK(rec);
 	xd->flags |= X_VC_DATA_FLAG_SVC_DESTROYED;
-	xd_refcnt = --(xd->refcnt);
+
+	rec->hdl.xd = NULL;
+	xd->refcnt--;
+
+	xprt->xp_p1 = NULL;
+	xd->refcnt--;
+
+	rpc_dplx_unref(rec, RPC_DPLX_FLAG_LOCKED);
 
 	__warnx(TIRPC_DEBUG_FLAG_REFCNT,
 		"%s: postfinalize %p xp_refs %" PRIu32
 		" xd_refcnt %u",
-		__func__, xprt, xprt->xp_refs, xd_refcnt);
+		__func__, xprt, xprt->xp_refs, xd->refcnt);
 
-	/* conditional destroy */
-	if (xd_refcnt == 0) {
-		__warnx(TIRPC_DEBUG_FLAG_REFCNT,
-			"%s: %p xp_refs %" PRIu32
-			" xd_refcnt %" PRIu32
-			" calling vc_shared_destroy @ %s:%d",
-			__func__, xprt, xprt->xp_refs, xd_refcnt, tag, line);
-		vc_shared_destroy(xd);	/* RECLOCKED */
-	} else {
-		__warnx(TIRPC_DEBUG_FLAG_REFCNT,
-			"%s: %p xp_refs %" PRIu32
-			" xd_refcnt %" PRIu32
-			" omit vc_shared_destroy @ %s:%d",
-			__func__, xprt, xprt->xp_refs, xd_refcnt, tag, line);
-		REC_UNLOCK(rec);
-	}
+	vc_shared_destroy(xd);	/* RECLOCKED */
 }
 
 extern mutex_t ops_lock;
@@ -781,7 +810,7 @@ svc_vc_rendezvous_control(SVCXPRT *xprt, const u_int rq, void *in)
 {
 	struct cf_rendezvous *cfp;
 
-	cfp = (struct cf_rendezvous *)xprt->xp_p1;
+	cfp = (struct cf_rendezvous *)xprt->xp_p2;
 	if (cfp == NULL)
 		return (FALSE);
 	switch (rq) {
@@ -1324,7 +1353,6 @@ svc_vc_ncreate_clnt(CLIENT *clnt, const u_int sendsz,
 	struct sockaddr_storage addr;
 	struct __rpc_sockinfo si;
 	SVCXPRT *xprt = NULL;
-	bool xprt_allocd;
 
 	fd = ct->ct_fd;
 	rpc_dplx_rlc(clnt);
@@ -1341,8 +1369,10 @@ svc_vc_ncreate_clnt(CLIENT *clnt, const u_int sendsz,
 	 * make a new transport
 	 */
 
-	xprt = makefd_xprt(fd, sendsz, recvsz, &xprt_allocd);
-	if ((!xprt) || (!xprt_allocd))	/* ref'd existing xprt handle */
+	xprt = makefd_xprt(fd, sendsz, recvsz);
+	if ((!xprt) ||  /* ref'd existing xprt */
+	    atomic_postclear_uint16_t_bits(&xprt->xp_flags,
+					   SVC_XPRT_FLAG_ALLOCATED))
 		goto unlock;
 
 	__rpc_set_address(&xprt->xp_remote, &addr, len);

@@ -103,7 +103,6 @@ svc_dg_ncreate(int fd, u_int sendsize, u_int recvsize)
 	struct __rpc_sockinfo si;
 	struct sockaddr_storage ss;
 	socklen_t slen;
-	uint32_t oflags;
 
 	if (!__rpc_fd2sockinfo(fd, &si)) {
 		__warnx(TIRPC_DEBUG_FLAG_SVC_DG, svc_dg_str, svc_dg_err1);
@@ -165,9 +164,8 @@ svc_dg_ncreate(int fd, u_int sendsize, u_int recvsize)
 	/* Enable reception of IP*_PKTINFO control msgs */
 	svc_dg_enable_pktinfo(fd, &si);
 
-	/* Make reachable */
-	xprt->xp_p5 = rpc_dplx_lookup_rec(
-		xprt->xp_fd, RPC_DPLX_FLAG_NONE, &oflags); /* ref+1 */
+	/* Make reachable - ref+1 */
+	xprt->xp_p5 = rpc_dplx_lookup_rec(xprt->xp_fd, RPC_DPLX_FLAG_NONE);
 	svc_rqst_init_xprt(xprt);
 
 	/* Conditional xprt_register */

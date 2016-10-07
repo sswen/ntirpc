@@ -63,7 +63,7 @@ extern size_t strlcpy(char *, const char *src, size_t);
 #define RPC_DPLX_LKP_IFLAG_LOCKREC    0x0001
 #define RPC_DPLX_LKP_OFLAG_ALLOC      0x0002
 
-struct rpc_dplx_rec *rpc_dplx_lookup_rec(int, uint32_t, uint32_t *);
+struct rpc_dplx_rec *rpc_dplx_lookup_rec(int, uint32_t);
 
 static inline void
 rpc_dplx_lock_init(struct rpc_dplx_lock *lock)
