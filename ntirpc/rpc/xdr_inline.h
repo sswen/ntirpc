@@ -602,23 +602,28 @@ inline_xdr_bytes(XDR *xdrs, char **cpp, u_int *sizep,
 	case XDR_DECODE:
 		if (nodesize == 0)
 			return (true);
-		if (sp == NULL)
-			*cpp = sp = (char *)mem_alloc(nodesize);
+
+		if (*cpp == NULL)
+			sp = (char *)mem_alloc(nodesize);
+
 		ret = inline_xdr_getopaque(xdrs, sp, nodesize);
-		if (! ret) {
+
+		if (!ret && *cpp == NULL)
 			free(sp);
-			*cpp = NULL;
-		}
+		else
+			*cpp = sp;
+
 		return (ret);
 
 	case XDR_ENCODE:
 		return (inline_xdr_putopaque(xdrs, sp, nodesize));
 
 	case XDR_FREE:
-		if (sp != NULL) {
-			mem_free(sp, -1);
+		if (*cpp) {
+			free(*cpp);
 			*cpp = NULL;
 		}
+
 		return (true);
 	}
 	/* NOTREACHED */
